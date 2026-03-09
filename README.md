@@ -104,8 +104,8 @@ WHERE balance > 10000;
 
 | Customer | Balance |
 | -------- | ------- |
-| John     | 15000   |
-| Mary     | 12000   |
+| Pavan    | 15000   |
+| Kumar   | 12000   |
 
 ---
 
