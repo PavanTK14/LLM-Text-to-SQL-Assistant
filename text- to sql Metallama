@@ -1,0 +1,98 @@
+import pandas as pd
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+import sqlite3
+import ipywidgets as widgets
+from IPython.display import display, HTML
+
+# Load Meta Llama 3 8B Instruct model
+model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32)
+
+# Connect to an in-memory SQLite database
+connection = sqlite3.connect(":memory:")
+device = torch.device("cpu")  # Use CPU
+model.to(device)
+
+# Load Excel file (ensure it exists)
+file_path = "data.xlsx"
+df = pd.read_excel(file_path)
+
+# Convert DataFrame to SQL table in memory
+df.to_sql("customers", connection, index=False, if_exists="replace")
+
+# Function to extract schema from DataFrame
+def get_schema(dataframe: pd.DataFrame):
+    return ", ".join(dataframe.columns)
+
+# Function to run SQL queries
+def run_sql_query(query: str, connection):
+    try:
+        print(f"Executing SQL: {query}")
+        result_df = pd.read_sql_query(query, connection)
+        return result_df if not result_df.empty else "No matching records found."
+    except Exception as e:
+        return f"Error executing query: {e}"
+
+# Function to generate SQL using Llama3-8B
+def generate_sql(natural_query, dataframe):
+    schema = get_schema(dataframe)
+    prompt = f"""
+    You are an AI assistant that generates only valid SQL queries. Do not include any extra text.
+   
+    Schema: {schema}
+
+    Question: {natural_query}
+
+    SQL Query:
+    """
+   
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    outputs = model.generate(**inputs, max_length=256, do_sample=False, temperature=0.5, top_k=20)
+   
+    sql_query = tokenizer.decode(outputs[0], skip_special_tokens=True).strip()
+
+    # Extract only the SQL query
+    sql_query = sql_query.split("SQL Query:")[-1].strip()
+
+    # Ensure the generated SQL is valid
+    forbidden_keywords = ["DROP", "DELETE", "--", "/*", "*/", "ALTER"]
+    if not sql_query or any(word in sql_query.upper() for word in forbidden_keywords):
+        print("Invalid or unsafe SQL generated.")
+        return None
+
+    print("Generated SQL:", sql_query)
+    return sql_query
+
+# Function to handle user input
+def on_button_click(b):
+    input_text = input_box.value.strip()
+    if not input_text:
+        output_box.value = "Please enter a natural language query."
+        return
+
+    sql_query = generate_sql(input_text, df)
+   
+    if not sql_query:
+        output_box.value = "Error: Invalid or unsafe SQL query generated."
+        return
+
+    result = run_sql_query(sql_query, connection)
+   
+    if isinstance(result, pd.DataFrame):
+        response = result.to_html()
+    else:
+        response = result  # Error message or "No matching records"
+
+    output_box.value = f"<b>Generated SQL:</b> {sql_query}<br><b>Result:</b><br>{response}"
+
+# Create chatbot interface
+input_box = widgets.Text(placeholder="Enter natural language query...")
+submit_button = widgets.Button(description="Submit")
+output_box = widgets.HTML()
+
+submit_button.on_click(on_button_click)
+
+# Display the widgets
+display(widgets.VBox([input_box, submit_button, output_box]))
