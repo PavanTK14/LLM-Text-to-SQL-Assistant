@@ -131,8 +131,8 @@ Queries are validated before execution using **DuckDB EXPLAIN**.
 
 
 
-
-NL2SQL RAG SQL Generator
+**
+NL2SQL RAG SQL Generator**
 
 Convert natural language queries into valid SQL with RAG, hybrid prompting, and guardrails.
 
