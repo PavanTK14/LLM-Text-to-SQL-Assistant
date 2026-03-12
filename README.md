@@ -128,4 +128,27 @@ Queries are validated before execution using **DuckDB EXPLAIN**.
 2. Extract database schema
 3. Convert schema columns into **TF-IDF embeddings**
 4. Store embeddings in **FAISS index**
-   5
+
+
+
+
+NL2SQL RAG SQL Generator
+
+Convert natural language queries into valid SQL with RAG, hybrid prompting, and guardrails.
+
+This project demonstrates:
+
+Multi-source database integration (S3 Excel/CSV + PostgreSQL/MySQL/SQL Server)
+
+DuckDB in-memory execution for fast query results
+
+Schema chunking & RAG with FAISS for relevant schema retrieval
+
+Hybrid prompting with reflection to improve LLM reasoning and prevent hallucinations
+
+Guardrails to block destructive or invalid SQL statements
+
+Streamlit UI for interactive question-to-SQL exploration
+
+Ideal for data analysts, AI/ML engineers, and anyone exploring LLM-assisted SQL generation.
+   
