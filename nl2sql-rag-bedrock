@@ -1,0 +1,182 @@
+import streamlit as st
+import pandas as pd
+import duckdb
+import faiss
+import numpy as np
+import boto3
+import json
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+# ---------------------- AWS BEDROCK SETUP ---------------------- #
+bedrock_client = boto3.client("bedrock-runtime", region_name="us-east-1")
+embedding_model_id = "amazon.titan-txt-embeddings-v2"
+
+# ---------------------- DATA LOADING ---------------------- #
+@st.cache_data
+def load_data(file_path="Banking_Dataset.xlsx"):
+    xls = pd.ExcelFile(file_path)
+    dfs = {}
+    for sheet in xls.sheet_names:
+        df = xls.parse(sheet)
+        df.columns = [col.strip().replace(" ", "_") for col in df.columns]
+        dfs[sheet] = df
+    return dfs
+
+dfs = load_data()
+
+# ---------------------- DUCKDB IN-MEMORY ---------------------- #
+conn = duckdb.connect(database=":memory:")
+for name, df in dfs.items():
+    conn.register(name, df)
+
+# ---------------------- SCHEMA CHUNKING ---------------------- #
+def chunk_schema(dfs, chunk_size=5):
+    """
+    Split table columns into chunks for RAG retrieval.
+    """
+    chunks = []
+    for table_name, df in dfs.items():
+        cols = df.columns.tolist()
+        for i in range(0, len(cols), chunk_size):
+            chunk_cols = cols[i:i+chunk_size]
+            chunks.append(f"{table_name}: {', '.join(chunk_cols)}")
+    return chunks
+
+schema_chunks = chunk_schema(dfs)
+
+# ---------------------- TF-IDF + FAISS ---------------------- #
+vectorizer = TfidfVectorizer()
+chunk_embeddings = vectorizer.fit_transform(schema_chunks).toarray().astype('float32')
+
+faiss_index = faiss.IndexFlatL2(chunk_embeddings.shape[1])
+faiss_index.add(chunk_embeddings)
+
+# ---------------------- SQL CACHE & HISTORY ---------------------- #
+sql_cache = {}
+question_history, sql_history = [], []
+question_embeddings, sql_embeddings = [], []
+
+# ---------------------- SQL UTILITY FUNCTIONS ---------------------- #
+def is_valid_sql(query):
+    try:
+        conn.execute(f"EXPLAIN {query}")
+        return True
+    except:
+        return False
+
+def run_sql_query(query):
+    try:
+        result_df = conn.execute(query).fetchdf()
+        return result_df.to_html(index=False), result_df
+    except Exception as e:
+        return f"Error: {e}", None
+
+# ---------------------- RAG RETRIEVAL ---------------------- #
+def retrieve_relevant_schema(query, top_k=5):
+    query_vec = vectorizer.transform([query]).toarray().astype('float32')
+    _, indices = faiss_index.search(query_vec, top_k)
+    relevant_chunks = [schema_chunks[i] for i in indices[0]]
+    return "\n".join(relevant_chunks)
+
+def search_history_faiss(text, top_k=3):
+    if not question_embeddings:
+        return [], []
+    query_vec = vectorizer.transform([text]).toarray().astype('float32')
+    _, indices = faiss_index.search(query_vec, top_k)
+    return [question_history[i] for i in indices[0]], [sql_history[i] for i in indices[0]]
+
+# ---------------------- HYBRID PROMPTING WITH REFLECTION & GUARDRAILS ---------------------- #
+def generate_sql_from_bedrock(natural_query):
+    if natural_query in sql_cache:
+        st.toast("Using cached SQL query...")
+        return sql_cache[natural_query]
+
+    # RAG: Retrieve relevant schema chunks
+    relevant_schema = retrieve_relevant_schema(natural_query, top_k=5)
+
+    # Guardrail: prevent destructive SQL
+    forbidden_keywords = ["DROP", "DELETE", "ALTER", "--", ";--"]
+
+    # Hybrid prompt with reflection
+    prompt = f"""
+You are a SQL expert assistant. Convert the user's natural language query into a valid DuckDB SQL query.
+Use only the following schema chunks relevant to the question:
+{relevant_schema}
+
+Question: {natural_query}
+
+Requirements:
+1. Avoid any destructive operations: {', '.join(forbidden_keywords)}
+2. Validate table and column existence.
+3. If uncertain about table/column mapping, reflect by suggesting the most probable mapping and explain assumptions.
+4. Return only a syntactically correct SQL query that runs on DuckDB.
+5. Do not hallucinate or invent tables/columns.
+
+SQL Query:
+"""
+
+    try:
+        # ---------------------- Call Bedrock ---------------------- #
+        body = json.dumps({"inputText": prompt})
+        response = bedrock_client.invoke_model(
+            body=body,
+            modelId=embedding_model_id,
+            accept="application/json",
+            contentType="application/json"
+        )
+        result = json.loads(response['body'].read().decode("utf-8"))
+        sql_query = result.get("results", [{}])[0].get("outputText", "").strip()
+
+        # Guardrail checks
+        if any(word in sql_query.upper() for word in forbidden_keywords):
+            st.warning("Generated SQL contains forbidden keywords. Skipping execution.")
+            return None
+
+        if not is_valid_sql(sql_query):
+            st.warning("Generated SQL is invalid according to DuckDB. Skipping execution.")
+            return None
+
+        # Update caches and FAISS embeddings for history tracking
+        sql_cache[natural_query] = sql_query
+        question_history.append(natural_query)
+        sql_history.append(sql_query)
+
+        q_emb = vectorizer.transform([natural_query]).toarray().astype('float32')
+        s_emb = vectorizer.transform([sql_query]).toarray().astype('float32')
+        question_embeddings.append(q_emb[0])
+        sql_embeddings.append(s_emb[0])
+        faiss_index.add(q_emb)
+        faiss_index.add(s_emb)
+
+        return sql_query
+    except Exception as e:
+        st.error(f"Bedrock API error: {e}")
+        return None
+
+# ---------------------- STREAMLIT UI ---------------------- #
+st.set_page_config(page_title="🔍 RAG SQL Generator", layout="wide")
+st.markdown("""<style>.main {background-color: #F0F2F6;}</style>""", unsafe_allow_html=True)
+st.title("🔍 Natural Language to SQL with RAG, Reflection & Guardrails")
+
+user_query = st.text_input("Ask a database question:")
+
+if st.button("Generate SQL") and user_query:
+    with st.spinner("Generating SQL with RAG and Bedrock..."):
+        sql_query = generate_sql_from_bedrock(user_query)
+
+    if sql_query:
+        st.subheader("🔧 Generated SQL")
+        st.code(sql_query, language="sql")
+
+        html_result, result_df = run_sql_query(sql_query)
+        st.subheader("📊 Query Result")
+        st.write(html_result, unsafe_allow_html=True)
+
+        similar_qs, similar_sqls = search_history_faiss(user_query)
+        if similar_qs:
+            st.markdown("---")
+            st.subheader("🧠 Similar Questions Previously Asked")
+            for i in range(len(similar_qs)):
+                st.markdown(f"**Q:** {similar_qs[i]}\n**SQL:** `{similar_sqls[i]}`")
+    else:
+        st.error("Could not generate a valid SQL query.")
